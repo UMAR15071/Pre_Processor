@@ -26,11 +26,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <ctype.h>
+#include <stdbool.h>
 #include "parser.h"
 #include "utils.c"
 #include "handle_typedefs.c"
+#include "linkedList.c"
+
+typedef struct{
+	bool isFalse;
+	int  doWhile;
+} ParserContext;
 
 typedef struct {
     bool isTypeDef;
@@ -45,8 +51,14 @@ typedef struct {
     bool isAtomic;
     int longCount;
 } SpecifierFlags;
-
 bool otherDataTypes = false;
+
+extern void push(bool isFalse); //This will push the nodes onto the stack.
+extern void populate_dot_file(FILE *dot_file);
+extern void pop(int branch_num);
+extern void join_nodes();
+extern int 	stack_count;
+extern void adjustDoWhile();
 
 extern int yylex();
 extern int yylineno;
@@ -57,25 +69,33 @@ extern char *yytext;
 #define MAX_PATH 256
 #define MAX_BRANCH_STR 9		//maximum length of the string encoding the number of branches (max is "999999999" i.e. 1 billion - 1)
 
+#define MAX_TOKENS 100  // Maximum number of tokens
+#define MAX_LENGTH 256  // Maximum string length
+
 int debugMode = 0;				//flag to indicate if we are in debug mode set by -d command line switch
 int dataModel = 32;				//flag to indicate data model used in the C code under analysis; set by -m32 or -m64 on the command line; default is 32
 long int TARGET_LONG_MAX = 2147483647L; //the default LONG_MAX for the code under test if dataModel = 32
 FILE* pl_file;					//the file of containing the Prolog predicated after parsing the target C file
 char i_file_uri[MAX_PATH];
-FILE *i_file;
+FILE* i_file;
+char dot_file_uri[3 * MAX_PATH];
+FILE* dot_file;
 char pl_file_uri[MAX_PATH];		//the full path to the Pl_file
 int branch_nb = 1;				//unique id for branches created
-//start: ugly, breaking parsing spirit, flags and temporary variables
+//start: ugly, breaking parsing spirit, flags and aorary variables
 int typedef_flag = 0; 			//indicates that we are within a typedef declaration
 int in_tag_namespace = 0;		//indicates to the lexer that we are in the tag namespace (for struct, union and enum tags) and that identifier should not be checked for typedef
 int in_member_namespace = 0;	//indicates to the lexer that we are in the member namespace (for members of stuct and unions) and that identifier should not be checked for typedef
 
 char *current_function;			//we keep track of the function being parsed so that we can add it to goto statements
+void yyerror(ParserContext *ctx, const char*);
+void my_exit(int);				//atats to close handles and delete generated files prior to caling exit(int);
 void process_declaration_specifiers(char a[]); //Processes declaration specifiers to generalize them for Sikraken i.e signed long int -> long.
-void yyerror(const char*);
-void my_exit(int);				//attempts to close handles and delete generated files prior to caling exit(int);
-
+void add_to_cfg(int node_num,char current_node[], char false_path[], char true_path[]); // This method will add nodes to the control flow graphs in dot format.
+char *previous_cfg_node = NULL;
 %}
+
+%parse-param { ParserContext *ctx }
 
 %union {
 	char* id;
@@ -165,7 +185,7 @@ constant
 	| ENUMERATION_CONSTANT	/* after it has been defined as such */
 	;
 
-enumeration_constant		/* before it has been defined as such */
+enumeration_constant		
 	: IDENTIFIER		//Ordinary namespace Id declaration
 	;
 
@@ -174,16 +194,16 @@ string
 	| FUNC_NAME			{simple_str_lit_copy(&$$, "thisFunctionName");}
 	;
 
-generic_selection	/* to do */
+generic_selection	
 	: GENERIC '(' assignment_expression ',' generic_assoc_list ')'
 	;
 
-generic_assoc_list	/* to do */
+generic_assoc_list	
 	: generic_association
 	| generic_assoc_list ',' generic_association
 	;
 
-generic_association	/* to do */
+generic_association	
 	: type_name ':' assignment_expression
 	| DEFAULT ':' assignment_expression
 	;
@@ -381,6 +401,7 @@ relational_expression
 	| relational_expression relational_expression_operator shift_expression
 		{size_t const size = strlen("(, )") + strlen($1) + strlen($2) + strlen($3) + 1;
 		 $$ = (char*)malloc(size);
+		 //printf("%s, %s, %s \n\n\n", $1, $2, $3);
 		 sprintf_safe($$, size, "%s(%s, %s)", $2, $1, $3);
 		 free($1);
 		 free($2);
@@ -399,7 +420,8 @@ relational_expression_operator
 equality_expression
 	: relational_expression
 	| equality_expression equality_expression_op relational_expression
-		{size_t const size = strlen("(, )") + strlen($1) + strlen($2) + strlen($3) + 1;
+		{//printf("EQUALITY SIZE OPERATOR %s\n", $3);
+		 size_t const size = strlen("(, )") + strlen($1) + strlen($2) + strlen($3) + 1;
 		 $$ = (char*)malloc(size);
 		 sprintf_safe($$, size, "%s(%s, %s)", $2, $1, $3);
 		 free($1);
@@ -538,16 +560,11 @@ declaration
 		 if (typedef_flag == 1) {	//we were processing typedef declarations
 	    	typedef_flag = 0; 
 			//if (debugMode) printf("Debug: typedef switched to 0\n");
-	   	 }
-		 if(!otherDataTypes){
-			process_declaration_specifiers($1);
-		 }else{
-			otherDataTypes = false;
-		 }
-		 
+	   	 } 
+		process_declaration_specifiers($1);
 		 size_t const size = strlen("\ndeclaration([], [])") + strlen($1) + strlen($2) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\ndeclaration([%s], [%s])", $1, $2);
+		 sprintf_safe($$, size, "\ndeclaration([%s], [%s]) \n", $1, $2);
 		 free($1);
 		 free($2);
 		}
@@ -577,7 +594,8 @@ declaration_specifiers
 		}
 	| type_specifier
 	| type_qualifier declaration_specifiers
-		{size_t const size = strlen(", ") + strlen($1) + strlen($2) + 1;
+		{
+		 size_t const size = strlen(", ") + strlen($1) + strlen($2) + 1;
 		 $$ = (char*)malloc(size);
 		 sprintf_safe($$, size, "%s, %s", $1, $2);
 		 free($1);
@@ -614,7 +632,7 @@ init_declarator
 		 free($1.ptr_declarator);
 	   	 //free($3);		//todo why is this commented out?
 	  	}
-	| declarator	// at the global level always add the empty initialiser: initializer([]) to trigger initialisation to 0, otherwise add 'no_initializer'
+	| declarator
 		{if (typedef_flag == 1) {	// we are parsing a typedef declaration
 			add_typedef_name($1.ptr_declarator);	
 	   	 }
@@ -624,7 +642,7 @@ init_declarator
 	;
 
 storage_class_specifier
-	: TYPEDEF	/* the following typedef declarator identifier must be added to the list of typedefs so that it will get identified as TYPEDEF_NAME in lexer and not as an identifier*/
+	: TYPEDEF	
 		{simple_str_lit_copy(&$$, "typedef");
          typedef_flag = 1;
 		 //if (debugMode) printf("Debug: typedef switched to 1\n");
@@ -638,7 +656,7 @@ storage_class_specifier
 
 type_specifier
 	: VOID					{ simple_str_lit_copy(&$$, "void"); }
-	| CHAR					{ simple_str_lit_copy(&$$, "char"); }
+	| CHAR					{ simple_str_lit_copy(&$$, "char"); otherDataTypes = true;}
 	| SHORT					{ simple_str_lit_copy(&$$, "short"); }
 	| INT					{ simple_str_lit_copy(&$$, "int"); }
 	| LONG					{ simple_str_lit_copy(&$$, "long"); }
@@ -648,7 +666,7 @@ type_specifier
 	| UNSIGNED				{ simple_str_lit_copy(&$$, "unsigned"); }
 	| BOOL					{ simple_str_lit_copy(&$$, "bool"); otherDataTypes = true;}
 	| COMPLEX				{ simple_str_lit_copy(&$$, "complex"); }
-	| IMAGINARY				{ simple_str_lit_copy(&$$, "imaginary"); } 	// non-mandated C extension
+	| IMAGINARY				{ simple_str_lit_copy(&$$, "imaginary"); } 	
 	| atomic_type_specifier	{ simple_str_lit_copy(&$$, "atomic_type_specifier"); }
 	| struct_or_union_specifier {otherDataTypes = true;}
 	| enum_specifier {otherDataTypes = true;}
@@ -670,24 +688,20 @@ struct_or_union_specifier
 	     free($4);
 	    }
 	| struct_or_union IDENTIFIER {in_tag_namespace = 0;} '{' struct_declaration_list '}'	//Tag namespace Id declaration
-		{char *tag_to_Prolog_var = to_prolog_var($2);
-		 size_t const size = strlen("(, [])") + strlen($1) + strlen(tag_to_Prolog_var) + strlen($5) + 1;
+		{size_t const size = strlen("(, [])") + strlen($1) + strlen($2) + strlen($5) + 1;
 	     $$ = (char*)malloc(size);
-	     sprintf_safe($$, size, "%s(%s, [%s])", $1, tag_to_Prolog_var, $5);
+	     sprintf_safe($$, size, "%s(%s, [%s])", $1, $2, $5);
 	     free($1);
 	     free($2);
 		 free($5);
-		 free(tag_to_Prolog_var);
 	    }
-	| struct_or_union IDENTIFIER	//forward declaration Tag namespace Id declaration or as part of a variable declaration
+	| struct_or_union IDENTIFIER	
 		{in_tag_namespace = 0;
-		 char *tag_to_Prolog_var = to_prolog_var($2);
-		 size_t const size = strlen("%s(%s)") + strlen($1) + strlen(tag_to_Prolog_var) + 1;
+		 size_t const size = strlen("%s(%s, 'forward')") + strlen($1) + strlen($2) + 1;
 	     $$ = (char*)malloc(size);
-	     sprintf_safe($$, size, "%s(%s)", $1, tag_to_Prolog_var);
+	     sprintf_safe($$, size, "%s(%s, 'forward')", $1, $2);
 	     free($1);
 	     free($2);
-		 free(tag_to_Prolog_var);
 	    }
 	;
 
@@ -714,13 +728,12 @@ struct_declaration_list
 	;
 
 struct_declaration
-	: specifier_qualifier_list ';'	//for inner "Anonymous Members in Structs" C11
-		{size_t const size = strlen("anonymous_member()") + strlen($1) + 1;
+	: specifier_qualifier_list ';'	/* for anonymous struct/union ?????????? */
+		{size_t const size = strlen("struct_decl_anonymous()") + strlen($1) + 1;
        	 $$ = (char*)malloc(size);
-         sprintf_safe($$, size, "anonymous_member(%s)", $1);
+         sprintf_safe($$, size, "struct_decl_anonymous(%s)", $1);
 	   	 free($1);
         }
-
 	| specifier_qualifier_list struct_declarator_list ';'
 		{size_t const size = strlen("struct_decl([], [])") + strlen($1) + strlen($2) + 1;
        	 $$ = (char*)malloc(size);
@@ -729,7 +742,7 @@ struct_declaration
 	   	 free($1);
 		 free($2);
         }
-	| static_assert_declaration	//default action
+	| static_assert_declaration
 	;
 
 specifier_qualifier_list
@@ -766,14 +779,14 @@ struct_declarator
 	: {in_member_namespace = 1;} struct_declarator2
 		{$$ = $2;}
 
-struct_declarator2		//added to avoid reduce-reduce conflict
-	: ':' {in_member_namespace = 0;} constant_expression		//bit field
+struct_declarator2		
+	: ':' {in_member_namespace = 0;} constant_expression
 		{size_t const size = strlen("anonymous_bit_field()") + strlen($3) + 1;
        	 $$ = (char*)malloc(size);
          sprintf_safe($$, size, "anonymous_bit_field(%s)", $3);
 	   	 free($3);
         } 
-	| declarator {in_member_namespace = 0;} ':'  constant_expression 	//bit field
+	| declarator {in_member_namespace = 0;} ':'  constant_expression 
 		{size_t const size = strlen("bit_field(, )") + strlen($1.full) + strlen($4) + 1;
        	 $$ = (char*)malloc(size);
          sprintf_safe($$, size, "bit_field(%s, %s)", $1.full, $4);
@@ -834,7 +847,7 @@ enumerator_list
         }
 	;
 
-enumerator	/* identifiers must be flagged as ENUMERATION_CONSTANT */
+enumerator	
 	: enumeration_constant '=' constant_expression
 		{size_t const size = strlen("init_enum(, )") + strlen($1) + strlen($3) + 1;
        	 $$ = (char*)malloc(size);
@@ -845,7 +858,7 @@ enumerator	/* identifiers must be flagged as ENUMERATION_CONSTANT */
 	| enumeration_constant
 	;
 
-atomic_type_specifier		// new in C11 for atomic operation: used in concurrency
+atomic_type_specifier		
 	: ATOMIC_SPECIFIER type_name ')'	//the opening parenthesis '(' is matched by the lexer
 	;
 
@@ -880,28 +893,19 @@ declarator
 
 direct_declarator
 	: IDENTIFIER		//Ordinary namespace id declaration unless within a struct declaration in which case it is a Member namespace id
-		{if (in_member_namespace) {	//this is a member (from a struct or union) no need to transform into a Prolog var
-			size_t const size = strlen($1) + 1;
-			$$.full = (char*)malloc(size);
-		 	strcpy_safe($$.full, size, $1);
-			$$.ptr_declarator = (char*)malloc(size);
-		 	strcpy_safe($$.ptr_declarator, size, $1);
-			in_member_namespace = 0;
+		{char Prolog_var_name[MAX_ID_LENGTH+5];	//todo should use to_prolog_var($1);
+		 if (islower($1[0])) {
+			Prolog_var_name[0] = toupper($1[0]);
+			strcpy_safe(&Prolog_var_name[1], MAX_ID_LENGTH-1, &$1[1]);
 		 } else {
-			char Prolog_var_name[MAX_ID_LENGTH+5];	//todo should use to_prolog_var($1);
-			if (islower($1[0])) {
-				Prolog_var_name[0] = toupper($1[0]);
-				strcpy_safe(&Prolog_var_name[1], MAX_ID_LENGTH-1, &$1[1]);
-			} else {
-				strcpy_safe(Prolog_var_name, MAX_ID_LENGTH, "UC_");
-				strcat_safe(Prolog_var_name, MAX_ID_LENGTH, $1);
-			}
-			size_t const size = strlen(Prolog_var_name) + 1;
-		 	$$.full = (char*)malloc(size);
-		 	strcpy_safe($$.full, size, Prolog_var_name);
-		 	$$.ptr_declarator = strdup($$.full);
-		 	free($1);
+			strcpy_safe(Prolog_var_name, MAX_ID_LENGTH, "UC_");
+			strcat_safe(Prolog_var_name, MAX_ID_LENGTH, $1);
 		 }
+		 size_t const size = strlen(Prolog_var_name) + 1;
+		 $$.full = (char*)malloc(size);
+		 strcpy_safe($$.full, size, Prolog_var_name);
+		 $$.ptr_declarator = strdup($$.full);
+		 free($1);
 		} 
 	| '(' declarator {in_member_namespace = 0;} ')'			//function pointer e.g. in "int (*func_ptr)(int, int);" delcarator is "*func_ptr"
 		//added in_member_namespace = 0; in case we are within a union or struct to indicate that we just processed the member and the rest my involve typedefs see diary 12/11/24
@@ -1043,7 +1047,9 @@ parameter_list
 
 parameter_declaration
 	: declaration_specifiers declarator
-		{size_t const size = strlen("param([], )") + strlen($1) + strlen($2.full) + 1;
+		{//printf("Function decalaration \n");
+		 process_declaration_specifiers($1);
+		 size_t const size = strlen("param([], )") + strlen($1) + strlen($2.full) + 1;
 	     $$ = (char*)malloc(size);
 	     sprintf_safe($$, size, "param([%s], %s)", $1, $2.full);
 	     free($1);
@@ -1124,8 +1130,6 @@ initializer
 	     free($2);
 		}
 	| assignment_expression
-	| '{' '}'
-		{simple_str_lit_copy(&$$, "initializer([])");}	//empty initialisers are allowed in GCC/Clang
 	;
 
 initializer_list
@@ -1154,7 +1158,7 @@ initializer_list
 		}
 	;
 
-designation	//C99 this is for named-initializer as opposed to positional-initializer
+designation	
 	: designator_list '='
 		{size_t const size = strlen("designation([])") + strlen($1) + 1;
 	     $$ = (char*)malloc(size);
@@ -1231,7 +1235,7 @@ labeled_statement
 	  }
 	;
 
-compound_statement	//aka a 'block'
+compound_statement	
 	: '{' '}'	{simple_str_lit_copy(&$$, "\ncmp_stmts([])");}
 	| '{' block_item_list '}' 
 	  {size_t const size = strlen("\ncmp_stmts([\n])") + strlen($2) + 1;
@@ -1244,7 +1248,8 @@ compound_statement	//aka a 'block'
 block_item_list
 	: block_item
 	| block_item_list block_item
-	  {size_t const size = strlen(", ") + strlen($1) + strlen($2) + 1;
+	  {//printf("block item: 	%s \n", $2);
+	   size_t const size = strlen(", ") + strlen($1) + strlen($2) + 1;
 	   $$ = (char*)malloc(size);
 	   sprintf_safe($$, size, "%s, %s", $1, $2);
 	   free($1);
@@ -1268,13 +1273,30 @@ expression_statement
 	;
 
 selection_statement
-	: IF '(' expression ')' statement else_opt 
-		{size_t const size = strlen("\nif_stmt(branch(, ),  )") + MAX_BRANCH_STR + strlen($3) + strlen($5) + strlen($6) + 1;
+	: IF '(' expression ')'{
+		printf("If statement %s \n", $3);
+		if(stack_count == 0){
+			printf("stack is zero\n");
+			push(ctx->isFalse); 
+			join_nodes();
+		}else{
+			push(ctx->isFalse);
+		}  
+		if(ctx->doWhile > 0){
+			top->inDoWhile == true;
+		}
+		ctx->isFalse = false;
+		} statement else_opt 
+		{printf("IF token matched %d, %s\n", branch_nb, $3);
+		 //printf("%s \n \n \n", $6);
+		 size_t const size = strlen("\nif_stmt(branch(, ),  )") + MAX_BRANCH_STR + strlen($3) + strlen($6) + strlen($7) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\nif_stmt(branch(%d, %s), %s %s)", branch_nb++, $3, $5, $6);
+		 //dd_to_cfg(branch_nb, $3, $6, $7);
+		 pop(branch_nb);
+		 sprintf_safe($$, size, "\nif_stmt(branch(%d, %s), %s %s)", branch_nb++, $3, $6, $7);
 		 free($3);
-		 free($5);
 		 free($6);
+		 free($7);
 		} 
 	| SWITCH '(' expression ')' statement
 		{size_t const size = strlen("\nswitch_stmt(, )") + strlen($3) + strlen($5) + 1;
@@ -1287,36 +1309,90 @@ selection_statement
 
 else_opt
 	: /* empty */		%prec LOWER_THAN_ELSE 	{simple_str_lit_copy(&$$, "");}
-	| ELSE statement
-		{size_t const size = strlen(", ") + strlen($2) + 1;
+	| ELSE{	printf("else token set to true\n");
+			ctx->isFalse = true;
+		} statement
+		{printf("ELSE token matched %s \n", $3);
+		 size_t const size = strlen(", ") + strlen($3) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, ", %s", $2);
-		 free($2);
+		 sprintf_safe($$, size, ", %s", $3);
+		 ctx->isFalse = false;
+		 free($3);
 		} 
 
 iteration_statement
-	: WHILE '(' expression ')' statement 
-		{size_t const size = strlen("\nwhile_stmt(branch(, ), )") + MAX_BRANCH_STR + strlen($3) + strlen($5) + 1;
+	: WHILE '(' expression ')'{ 
+		if(stack_count == 0){
+			printf("stack is zero\n");
+			push(ctx->isFalse); 
+			join_nodes();
+		}else{
+				push(ctx->isFalse);
+		}
+		if(ctx->doWhile > 0){
+			top->inDoWhile == true;
+		}
+		}statement 
+		{size_t const size = strlen("\nwhile_stmt(branch(, ), )") + MAX_BRANCH_STR + strlen($3) + strlen($6) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\nwhile_stmt(branch(%d, %s), %s)", branch_nb++, $3, $5);
+		 if(top->true_path == NULL){
+			top->true_path = top;
+		 }
+		 join_nodes();
+		 pop(branch_nb);
+		 printf("while loop poped %d\n", branch_nb);
+		 sprintf_safe($$, size, "\nwhile_stmt(branch(%d, %s), %s)", branch_nb++, $3, $6);
 		 free($3);
-		 free($5);
+		 free($6);
 		} 
-	| DO statement WHILE '(' expression ')' ';'
-		{size_t const size = strlen("\ndo_while_stmt(, branch(, ))") + strlen($2) + MAX_BRANCH_STR + strlen($5) + 1;
+	| DO {ctx->doWhile++;}statement WHILE '(' expression ')' ';'
+		{printf("do while going onto the stack\n");
+		if(stack_count == 0){
+			printf("stack is zero\n");
+			push(ctx->isFalse); 
+			join_nodes();
+			} else{
+				push(ctx->isFalse);
+			}
+		 if(top->true_path == NULL){
+			top->true_path = top;
+		 }
+		 join_nodes();
+		 pop(branch_nb);
+		 adjustDoWhile();
+		 ctx->doWhile--;
+		 printf("do while loop poped %d\n", branch_nb);
+		 size_t const size = strlen("\ndo_while_stmt(, )") + strlen($3) + strlen($6) + 1;
 		 $$ = (char*)malloc(size);
 		 sprintf_safe($$, size, "\ndo_while_stmt(%s, branch(%d, %s))", $2, branch_nb++, $5);
-		 free($2);
-		 free($5);
+		 free($3);
+		 free($6);
 		} 
-	| FOR '(' for_stmt_type ')' statement	//replaced by an equivalent, a little ugly, while statement
-		{size_t const size = strlen("\ncmp_stmts([, \nwhile_stmt(branch(, ), \ncmp_stmts([, ]))])") + strlen($3.init) + MAX_BRANCH_STR + strlen($3.cond) + strlen($5) + strlen($3.update) + 1;
+	| FOR '(' for_stmt_type ')' {
+		if(stack_count == 0){
+			printf("stack is zero\n");
+			push(ctx->isFalse);
+			join_nodes();
+			} else{
+				push(ctx->isFalse);
+			}
+		if(ctx->doWhile > 0){
+			top->inDoWhile == true;
+		}
+		} statement	//replaced by an equivalent, a little ugly, while statement
+		{size_t const size = strlen("\ncmp_stmts([, \nwhile_stmt(branch(, ), \ncmp_stmts([, ]))])") + strlen($3.init) + MAX_BRANCH_STR + strlen($3.cond) + strlen($6) + strlen($3.update) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\ncmp_stmts([%s, \nwhile_stmt(branch(%d, %s), \ncmp_stmts([%s, %s]))])", $3.init, branch_nb++, $3.cond, $5, $3.update);
+		 if(top->true_path == NULL){
+			top->true_path = top;
+		 }
+		 join_nodes();
+		 pop(branch_nb);
+		 printf("for loop poped %d\n", branch_nb);
+		 sprintf_safe($$, size, "\ncmp_stmts([%s, \nwhile_stmt(branch(%d, %s), \ncmp_stmts([%s, %s]))])", $3.init, branch_nb++, $3.cond, $6, $3.update);
 		 free($3.init);
 		 free($3.cond);
 		 free($3.update);
-		 free($5);
+		 free($6);
 		} 
 	;
 //changed the original grammar by replacing the middle expression_statement (the condition) with expression_opt ';'
@@ -1350,12 +1426,12 @@ jump_statement
 	;
 
 //top level rule
-translation_unit 			//printed out
+translation_unit 			
 	: external_declaration
 	| translation_unit {fprintf(pl_file, ", \n");} external_declaration
 	;
 
-external_declaration		//printed out
+external_declaration		
 	: function_definition	{fprintf(pl_file, "%s", $1); free($1);}
 	| declaration			{fprintf(pl_file, "%s", $1); free($1);}
 	;
@@ -1394,127 +1470,186 @@ declaration_list
 #include "lex.yy.c"
 
 int main(int argc, char *argv[]) {
-	char C_file_path[MAX_PATH];				//directory where the C and .i files are
-	char filename_no_ext[MAX_PATH];
+    char C_file_path[MAX_PATH];                // Directory where the C and .i files are
+    char filename_no_ext[MAX_PATH];
+	ParserContext ctx = {0};
 
 #ifdef _MSC_VER
-	strcpy_safe(C_file_path, 3, ".");		//default path for input file is current directory, overwrite with -p on command line
+    strcpy_safe(C_file_path, 3, ".");          // Default path for input file is current directory, overwrite with -p on command line
 #else
-	strcpy_safe(C_file_path, 3, ".");
+    strcpy_safe(C_file_path, 3, ".");
 #endif
-	for (int i = 1; i <= argc - 1; i++) {	//processing command line arguments
-		if (argv[i][0] == '-') {
-			switch (argv[i][1]) {
-			case 'h':
-				printf("Usage: .\\sikraken_parser [OPTION]... FILE_NO_EXT\nParses the .i file of a C file pre-processsed by GCC to Prolog terms.\n\n-h\t Display help information\n-m32|-m64\t Specify the data model, -m32 is the default\n-p\t Path to the .c/.i file (DEFAULT: Current Directory ('.'))\n\nExamples:\n\t.\\sikraken_parser -p\".\" get_sign \n\t.\\sikraken_parser get_sign \n\t.\\sikraken_parser -m64 -p\"C:/Parser/\" sign \n");
-				my_exit(0);
-			case 'p':	//path to the .i pre-processed input C file
-				if (access_safe(&argv[i][2], 0) == -1) {    //checks if it is a valid directory
-					fprintf(stderr, "Sikraken parser error: the indicated source path (via -p switch): %s , cannot be accessed\n", &argv[i][2]);
-					my_exit(1);
-				}
-				strcpy_safe(C_file_path, MAX_PATH, &argv[i][2]);
-				break;
-			case 'd':
-				debugMode = 1;	//we are in debug mode (false is default): will affect output of warnings amongst other things
-				break;
-			case 'm':
-				if (argv[i][2] == '6' && argv[i][3] == '4') {
-					dataModel = 64;		//anything else is assumed default i.e. 32 bit
-					TARGET_LONG_MAX = 9223372036854775807LL;	//i.e. LONG_MAX for 64 bits target (using LL in case compiler is running on a 32bit machine)
-				}
-				break;
-			default:
-				fprintf(stderr, "Sikraken parser: Unsupported flag '-%s', ignoring.\n", argv[i]);
-			}
-		}
-		else {	//must be the filename to analyse
-			strcpy_safe(filename_no_ext, MAX_PATH, argv[i]);
-		}
-	}
-	fprintf(stdout, "Sikraken parser: using %i bits data model.\n", dataModel); 
 
-	sprintf_safe(i_file_uri, 3*MAX_PATH, "%s/%s.i", C_file_path, filename_no_ext);
-	if (fopen_safe(&i_file, i_file_uri, "r") != 0) {
-		fprintf(stderr, ".i file could not be opened for reading at: %s\n", i_file_uri);
-		my_exit(EXIT_FAILURE);
-	}
-	yyin = i_file;	//set the input to the parser
-	sprintf_safe(pl_file_uri, 3*MAX_PATH, "%s/%s.pl", C_file_path, filename_no_ext);
-	if (fopen_safe(&pl_file, pl_file_uri, "w") != 0) {
-		fprintf(stderr, ".pl file could not be created for writing at: %s\n", pl_file_uri);
-		my_exit(EXIT_FAILURE);
-	}
-	fprintf(pl_file, "prolog_c([");			//opening predicate
-	if (yyparse() != 0) {					//the parser is called
-		fprintf(stderr, "Parsing failed.\n");
-		my_exit(EXIT_FAILURE);
-	}	
-	fprintf(pl_file, "\n]).");
-	fclose(pl_file);
-	pl_file = NULL;
-	fclose(i_file);
-	i_file = NULL;
-	my_exit(EXIT_SUCCESS);
+    for (int i = 1; i <= argc - 1; i++) {      // Processing command line arguments
+        if (argv[i][0] == '-') {
+            switch (argv[i][1]) {
+            case 'h':
+                printf("Usage: .\\sikraken_parser [OPTION]... FILE_NO_EXT\nParses the .i file of a C file pre-processed by GCC to Prolog terms.\n\n-h\t Display help information\n-m32|-m64\t Specify the data model, -m32 is the default\n-p\t Path to the .c/.i file (DEFAULT: Current Directory ('.'))\n\nExamples:\n\t.\\sikraken_parser -p\".\" get_sign \n\t.\\sikraken_parser get_sign \n\t.\\sikraken_parser -m64 -p\"C:/Parser/\" sign \n");
+                my_exit(0);
+            case 'p':    // Path to the .i pre-processed input C file
+                if (access_safe(&argv[i][2], 0) == -1) {    // Checks if it is a valid directory
+                    fprintf(stderr, "Sikraken parser error: the indicated source path (via -p switch): %s , cannot be accessed\n", &argv[i][2]);
+                    my_exit(1);
+                }
+                strcpy_safe(C_file_path, MAX_PATH, &argv[i][2]);
+                break;
+            case 'd':
+                debugMode = 1;    // Debug mode (false is default): affects output of warnings among other things
+                break;
+            case 'm':
+                if (argv[i][2] == '6' && argv[i][3] == '4') {
+                    dataModel = 64;        // Anything else is assumed default i.e. 32-bit
+                    TARGET_LONG_MAX = 9223372036854775807LL;    // LONG_MAX for 64 bits target (using LL in case compiler is running on a 32-bit machine)
+                }
+                break;
+            default:
+                fprintf(stderr, "Sikraken parser: Unsupported flag '-%s', ignoring.\n", argv[i]);
+            }
+        } else {    // Must be the filename to analyze
+            strcpy_safe(filename_no_ext, MAX_PATH, argv[i]);
+        }
+    }
+
+    fprintf(stdout, "Sikraken parser: using %i bits data model.\n", dataModel);
+
+    // Construct the file URIs
+    sprintf_safe(i_file_uri, 3 * MAX_PATH, "%s/%s.i", C_file_path, filename_no_ext);
+    if (fopen_safe(&i_file, i_file_uri, "r") != 0) {
+        fprintf(stderr, ".i file could not be opened for reading at: %s\n", i_file_uri);
+        my_exit(EXIT_FAILURE);
+    }
+    yyin = i_file;    // Set the input to the parser
+
+    sprintf_safe(pl_file_uri, 3 * MAX_PATH, "%s/%s.pl", C_file_path, filename_no_ext);
+    if (fopen_safe(&pl_file, pl_file_uri, "w") != 0) {
+        fprintf(stderr, ".pl file could not be created for writing at: %s\n", pl_file_uri);
+        my_exit(EXIT_FAILURE);
+    }
+
+    // Open the .dot file for writing
+    sprintf_safe(dot_file_uri, 3 * MAX_PATH, "%s/%s.dot", C_file_path, filename_no_ext);
+    dot_file = fopen(dot_file_uri, "w");
+    if (!dot_file) {
+        fprintf(stderr, ".dot file could not be created for writing at: %s\n", dot_file_uri);
+        my_exit(EXIT_FAILURE);
+    }
+
+    // Write initial content to the .dot file
+    fprintf(dot_file, "digraph CFG {\n");
+	//previous_cfg_node = (char *)malloc((strlen("start") + 1) * sizeof(char));
+	//strcpy(previous_cfg_node, "Start");
+
+    // Parsing process
+    fprintf(pl_file, "prolog_c([");            // Opening predicate
+    if (yyparse(&ctx) != 0) {                      // The parser is called
+        fprintf(stderr, "Parsing failed.\n");
+        fclose(dot_file);                      // Close the .dot file on failure
+        my_exit(EXIT_FAILURE);
+    }
+    fprintf(pl_file, "\n]).");
+    fclose(pl_file);
+    pl_file = NULL;
+
+	populate_dot_file(dot_file);
+    // Finalize the .dot file
+	//fprintf(dot_file, "\"%s\" -> \"end\";\n", previous_cfg_node);
+    fprintf(dot_file, "}\n");
+	free(previous_cfg_node);
+    fclose(dot_file);
+    dot_file = NULL;
+
+    fclose(i_file);
+    i_file = NULL;
+
+    my_exit(EXIT_SUCCESS);
 }
+
 
 void process_declaration_specifiers(char a[]) {
-    char *token;
-    SpecifierFlags flags = {false};
-    flags.isSigned = true;
+	if(!otherDataTypes){
+		char *token;
+		SpecifierFlags flags = {false};
+		flags.isSigned = true;
 
-    // Allocate temp with enough space
-    char *temp = (char *)malloc(sizeof(char) * (strlen(a) + 1));
-    if (!temp) {
-        perror("Memory allocation failed");
-        return;
-    }
-    strcpy(temp, a);
+		// Allocate temp with enough space
+		char *temp = (char *)malloc(sizeof(char) * (strlen(a) + 1));
+		if (!temp) {
+			perror("Memory allocation failed");
+			return;
+		}
+		else{
+			strcpy(temp, a);
+		}
 
-    char result[1024] = ""; 
-    token = strtok(temp, ", ");
-    while (token != NULL) {
-        if (strcmp(token, "int") == 0) { printf("TOKEN:	%s \n", token); }
-        else if (strcmp(token, "long") == 0) { flags.longCount++; }
-        else if (strcmp(token, "short") == 0) { flags.isShort = true; }
-        else if (strcmp(token, "unsigned") == 0) { flags.isSigned = false; }
-        else if (strcmp(token, "const") == 0) { flags.isConstant = true; }
-        else if (strcmp(token, "static") == 0) { flags.isStatic = true; }
-        else if (strcmp(token, "extern") == 0) { flags.isExtern = true; }
-        else if (strcmp(token, "typedef") == 0) { flags.isTypeDef = true; }
-        else if (strcmp(token, "volatile") == 0) { flags.isVolatile = true; }
-        else if (strcmp(token, "atomic") == 0) { flags.isAtomic = true; }
+		char result[1024] = ""; 
+		token = strtok(temp, ", ");
+		while (token != NULL) {
+			if (strcmp(token, "long") == 0) { flags.longCount++; }
+			else if (strcmp(token, "short") == 0) { flags.isShort = true; }
+			else if (strcmp(token, "unsigned") == 0) { flags.isSigned = false; }
+			else if (strcmp(token, "const") == 0) { flags.isConstant = true; }
+			else if (strcmp(token, "static") == 0) { flags.isStatic = true; }
+			else if (strcmp(token, "extern") == 0) { flags.isExtern = true; }
+			else if (strcmp(token, "typedef") == 0) { flags.isTypeDef = true; }
+			else if (strcmp(token, "volatile") == 0) { flags.isVolatile = true; }
+			else if (strcmp(token, "atomic") == 0) { flags.isAtomic = true; }
 
-        token = strtok(NULL, ", ");
-    }
-    if (flags.isTypeDef) strcat(result, "typedef, ");
-    if (flags.isExtern) strcat(result, "extern, ");
-    if (flags.isConstant) strcat(result, "const, ");
-    if (flags.isStatic) strcat(result, "static, ");
-    if (flags.isVolatile) strcat(result, "volatile, ");
-    if (flags.isAtomic) strcat(result, "atomic, ");
+			token = strtok(NULL, ", ");
+		}
+		if (flags.isTypeDef) strcat(result, "typedef, ");
+		if (flags.isExtern) strcat(result, "extern, ");
+		if (flags.isConstant) strcat(result, "const, ");
+		if (flags.isStatic) strcat(result, "static, ");
+		if (flags.isVolatile) strcat(result, "volatile, ");
+		if (flags.isAtomic) strcat(result, "atomic, ");
 
-    if (flags.isSigned) {
-        if (flags.longCount == 1) strcat(result, "long");
-        else if (flags.longCount == 2) strcat(result, "long, long");
-        else if (flags.isShort) strcat(result, "short");
-        else strcat(result, "int");
-    } else {
-        if (flags.longCount == 1) strcat(result, "unsigned, long");
-        else if (flags.longCount == 2) strcat(result, "unsigned, long, long");
-        else if (flags.isShort) strcat(result, "unsigned, short");
-        else strcat(result, "unsigned, int");
-    }
-	otherDataTypes = false;
-    strncpy(a, result, strlen(result) + 1);
-    free(temp);
+		if (flags.isSigned) {
+			if (flags.longCount == 1) strcat(result, "long");
+			else if (flags.longCount == 2) strcat(result, "long, long");
+			else if (flags.isShort) strcat(result, "short");
+			else strcat(result, "int");
+		} else {
+			if (flags.longCount == 1) strcat(result, "unsigned, long");
+			else if (flags.longCount == 2) strcat(result, "unsigned, long, long");
+			else if (flags.isShort) strcat(result, "unsigned, short");
+			else strcat(result, "unsigned, int");
+		}
+		otherDataTypes = false;
+		strncpy(a, result, strlen(result) + 1);
+		free(temp);
+	}else{
+		otherDataTypes = false;
+	}
+    
 }
 
-
+/*void add_to_cfg(int node_num, char current_node[], char true_path[], char false_path[]){
+	if(top != NULL){
+		printf("condition true\n");
+		if(strstr(false_path, top->expression) != NULL){
+			printf("branch number: %d\n",branch_nb);
+			printf("false path length: 	%zu\n", strlen(false_path));
+			fprintf(dot_file, "\"%d\" -> \"%d\"		[label = \"F\"]; \n", node_num, top->branch_nb);
+			pop();
+		}
+		if(top != NULL){
+			if(strstr(true_path, top->expression) != NULL){
+				printf("branch number: %s\n",top->expression);
+				fprintf(dot_file, "\"%d\" -> \"%d\"		[label = \"T\"]; \n", node_num, top->branch_nb);
+				pop();
+			}
+		}
+		//push(current_node);
+	}else{
+		printf("branch number: %d\n",branch_nb);
+		//push(node_num,current_node);
+	}
+}
+*/
 //handles parsing errors: since the C input file is the output of a C pre-processor it will only be called if
 //  the syntax rules are wrong due to GCC extensions 
 //  or if .i file has been generated manually: i.e. during development
-void yyerror(const char* s) {
+void yyerror(ParserContext *ctx, const char* s) {
 	extern char* yytext;  	// Points to the text of the current token
     extern int yyleng;    	// Length of the current token
     const char* token_name = (yychar >= 0 && yychar < YYNTOKENS) ? yytname[yychar] : "unknown token";
