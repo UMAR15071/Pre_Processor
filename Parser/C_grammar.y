@@ -90,6 +90,7 @@ extern FILE *yyin;
 extern char *yytext;
 extern void set_to_user_define(char *function);
 extern void add_branch_number(char* function_name, int branch_num);
+extern void generate_call_graph(FILE *call_graph);
 
 #define MAX_PATH 256
 #define MAX_BRANCH_STR 9		//maximum length of the string encoding the number of branches (max is "999999999" i.e. 1 billion - 1)
@@ -253,12 +254,24 @@ postfix_expression
 		{size_t const size = strlen("function_call(, [])") + strlen($1) + 1;
 		 $$ = (char*)malloc(size);
 		 sprintf_safe($$, size, "function_call(%s, [])", $1);
+		 printf("function name %s\n", $1);
+		 if(top!=NULL){
+			add_branch_number($1, top->branch_nb);
+		 }else{
+			add_branch_number($1, 0);
+		 }
 		 free($1);
 		}
 	| postfix_expression '(' argument_expression_list ')'	/* function call */
 		{size_t const size = strlen("function_call(, [])") + strlen($1) + strlen($3) + 1;
 		 $$ = (char*)malloc(size);
 		 sprintf_safe($$, size, "function_call(%s, [%s])", $1, $3);
+		 printf("function name %s\n", $1);
+		 if(top!=NULL){
+			add_branch_number($1, top->branch_nb);
+		 }else{
+			add_branch_number($1, 0);
+		 }
 		 free($1);
 		 free($3);
 		}
@@ -1051,12 +1064,6 @@ direct_declarator
 		 size_t const size = strlen("function(, )") + strlen($1.full) + strlen($4) + 1;
 	     $$.full = (char*)malloc(size);
 	     sprintf_safe($$.full, size, "function(%s, %s)", $1.full, $4);
-		 if(top!=NULL){
-			add_branch_number($1.full, top->branch_nb);
-		 }else{
-			add_branch_number($1.full, 0);
-		 }
-		 
 		 set_to_user_define($1.full);
 		 current_function = strdup($1.full);
 	     free($1.full);
@@ -1700,6 +1707,7 @@ int main(int argc, char *argv[]) {
     fclose(dot_file);
     dot_file = NULL;
 
+	generate_call_graph(call_graph);
 	fprintf(call_graph, "}\n");
     fclose(call_graph);
     call_graph = NULL;

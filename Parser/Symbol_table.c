@@ -58,3 +58,21 @@ void add_branch_number(char* function_name, int branch_num) {
     new_entry->branch_numbers[0] = branch_num;
     new_entry->branch_count = 1;
 }
+
+void generate_call_graph(FILE *call_graph) {
+    FunctionEntry *temp = function_list_head;
+    while (temp != NULL) {
+        for (int i = 0; i < temp->branch_count; i++) {
+            if(temp->user_defined){
+                if (temp->branch_numbers[i] == 0) {
+                    fprintf(call_graph, "\"Start\" -> \"%s\";\n", temp->function_name);
+                } else {
+                    fprintf(call_graph, "\"%d\" -> \"%s\";\n", temp->branch_numbers[i], temp->function_name);
+                }
+            }else{
+                break;
+            }
+        }
+        temp = temp->next;
+    }
+}

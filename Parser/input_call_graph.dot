@@ -1,2 +1,5 @@
 digraph call_graph {
+"Start" -> "Print_message";
+"Start" -> "Add";
+"Start" -> "Greet";
 }
