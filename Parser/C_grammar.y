@@ -32,6 +32,7 @@
 #include "utils.c"
 #include "handle_typedefs.c"
 #include "Symbol_table.c"
+#include "MemoryStack.c"
 
 typedef struct {
     bool isTypeDef;
@@ -48,10 +49,40 @@ typedef struct {
 } SpecifierFlags;
 
 typedef struct{
+	bool isFalse;
+	bool labelParsed;
+	bool gotoParsed;
+	int  breakOn;
+	int  loopNo;
+	bool isDefault;
+	bool nestedDoWhile;
+	bool switchOn;
+	char* funName;
+	int  doWhile;
 	bool isDouble;
 	bool isInt;
+	char label_name[100];
+
 } ParserContext;
 
+extern Node *top;
+extern bool startNode;
+extern void push(bool isFalse, int loopNo); //This will push the nodes onto the stack.
+extern void populate_dot_file(FILE *dot_file, char* funName);
+extern void connectDoWhile(int doWhile);
+extern void pop(int branch_num);
+extern void join_nodes(Node *node);
+extern void attach_start(FILE *dot_file, char* funName);
+extern void removeBreaks(int loopNo);
+extern Node* getBreakPoint();
+extern void terminateNode(bool isFalse);
+void connectNodes(ParserContext *ctx);
+extern Node* find_loop(int loopNo);
+extern void add_goto(const char *name, Node* jumpNode, bool isFalse);
+extern void add_label(const char *name, Node* targetNode);
+extern void resolve_gotos();
+extern void free_storage();
+extern void loopAround();//method used for loops to make them connect to themselves.
 extern int yylex();
 extern int yylineno;
 
@@ -69,6 +100,10 @@ long int TARGET_LONG_MAX = 2147483647L; //the default LONG_MAX for the code unde
 FILE* pl_file;					//the file of containing the Prolog predicated after parsing the target C file
 char i_file_uri[MAX_PATH];
 FILE *i_file;
+char dot_file_uri[3 * MAX_PATH];
+FILE* dot_file;
+char call_graph_uri[3 * MAX_PATH];
+FILE* call_graph;
 char pl_file_uri[MAX_PATH];		//the full path to the Pl_file
 int branch_nb = 1;				//unique id for branches created
 //start: ugly, breaking parsing spirit, flags and temporary variables
@@ -86,6 +121,8 @@ void yyerror(ParserContext *ctx, const char*);
 void my_exit(int);				//attempts to close handles and delete generated files prior to caling exit(int);
 void process_declaration_specifiers(char a[]);
 
+void add_to_cfg(int node_num,char current_node[], char false_path[], char true_path[]); // This method will add nodes to the control flow graphs in dot format.
+char *previous_cfg_node = NULL;
 %}
 
 %parse-param { ParserContext *ctx }
@@ -493,13 +530,19 @@ logical_or_expression
 
 conditional_expression
 	: logical_or_expression
-	| logical_or_expression '?' expression ':' conditional_expression 
-		{size_t const size = strlen("cond_exp(branch(, ), , )") + branch_nb++ + strlen($1) + strlen($3) + strlen($5) + 1;
+	| logical_or_expression{
+		push(ctx->isFalse, ctx->loopNo);
+		connectNodes(ctx);
+	} '?' expression ':'{ctx->isFalse = true;} conditional_expression 
+		{size_t const size = strlen("cond_exp(branch(, ), , )") + branch_nb + strlen($1) + strlen($4) + strlen($7) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "cond_exp(branch(%d, %s), %s, %s)", branch_nb++, $1, $3, $5);
+		 pop(branch_nb);
+		 attach_start(dot_file, ctx->funName);
+		 sprintf_safe($$, size, "cond_exp(branch(%d, %s), %s, %s)", branch_nb++, $1, $4, $7);
+		 ctx->isFalse = false;
 		 free($1);
-		 free($3);
-		 free($5);
+		 free($4);
+		 free($7);
 		}
 	;
 
@@ -1008,7 +1051,12 @@ direct_declarator
 		 size_t const size = strlen("function(, )") + strlen($1.full) + strlen($4) + 1;
 	     $$.full = (char*)malloc(size);
 	     sprintf_safe($$.full, size, "function(%s, %s)", $1.full, $4);
-		 add_branch_number($1.full, branch_nb);
+		 if(top!=NULL){
+			add_branch_number($1.full, top->branch_nb);
+		 }else{
+			add_branch_number($1.full, 0);
+		 }
+		 
 		 set_to_user_define($1.full);
 		 current_function = strdup($1.full);
 	     free($1.full);
@@ -1265,12 +1313,12 @@ statement
 	;
 
 labeled_statement
-	: IDENTIFIER ':' statement 	//Label Id declaration
-	  {size_t const size = strlen("label_stmt(, )") + strlen($1) + strlen($3) + 1;
+	: IDENTIFIER{ctx->labelParsed = true; strcpy(ctx->label_name, $1);} ':' statement 	//Label Id declaration
+	  {size_t const size = strlen("label_stmt(, )") + strlen($1) + strlen($4) + 1;
 	   $$ = (char*)malloc(size);
-	   sprintf_safe($$, size, "label_stmt(%s, %s)", $1, $3);
+	   sprintf_safe($$, size, "label_stmt(%s, %s)", $1, $4);
 	   free($1);
-	   free($3);
+	   free($4);
 	  }
 	| //fake rule in case a label is wrongly identified as a TYPEDEF_NAME
 	  TYPEDEF_NAME ':' statement 	//Label Id declaration
@@ -1280,18 +1328,25 @@ labeled_statement
 	   free($1);
 	   free($3);
 	  }
-	| CASE constant_expression ':' statement
-	  {size_t const size = strlen("case_stmt(, )") + strlen($2) + strlen($4) + 1;
+	| CASE constant_expression {
+		push(ctx->isFalse, ctx->loopNo);
+		connectNodes(ctx);
+		join_nodes(top);
+		ctx->isFalse = false;
+	} ':' statement
+	  {size_t const size = strlen("case_stmt(, )") + strlen($2) + strlen($5) + 1;
 	   $$ = (char*)malloc(size);
-	   sprintf_safe($$, size, "case_stmt(%s, %s)", $2, $4);
+	   pop(branch_nb++);
+	   attach_start(dot_file, ctx->funName);
+	   sprintf_safe($$, size, "case_stmt(%s, %s)", $2, $5);
 	   free($2);
-	   free($4);
+	   free($5);
 	  }
-	| DEFAULT ':' statement
-	  {size_t const size = strlen("default_stmt(, )") + strlen($3) + 1;
+	| DEFAULT {ctx->isDefault == true;} ':' statement
+	  {size_t const size = strlen("default_stmt(, )") + strlen($4) + 1;
 	   $$ = (char*)malloc(size);
-	   sprintf_safe($$, size, "default_stmt(%s)", $3);
-	   free($3);
+	   sprintf_safe($$, size, "default_stmt(%s)", $4);
+	   free($4);
 	  }
 	;
 
@@ -1308,7 +1363,8 @@ compound_statement	//aka a 'block'
 block_item_list
 	: block_item {in_ordinary_id_declaration = 0;}
 	| block_item_list block_item {in_ordinary_id_declaration = 0;}
-	  {size_t const size = strlen(", ") + strlen($1) + strlen($2) + 1;
+	  {
+	   size_t const size = strlen(", ") + strlen($1) + strlen($2) + 1;
 	   $$ = (char*)malloc(size);
 	   sprintf_safe($$, size, "%s, %s", $1, $2);
 	   free($1);
@@ -1332,55 +1388,96 @@ expression_statement
 	;
 
 selection_statement
-	: IF '(' expression ')' statement else_opt 
-		{size_t const size = strlen("\nif_stmt(branch(, ),  )") + MAX_BRANCH_STR + strlen($3) + strlen($5) + strlen($6) + 1;
+	: IF '(' expression ')'{
+		push(ctx->isFalse, ctx->loopNo);
+		connectNodes(ctx);
+		} statement else_opt 
+		{size_t const size = strlen("\nif_stmt(branch(, ),  )") + MAX_BRANCH_STR + strlen($3) + strlen($6) + strlen($7) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\nif_stmt(branch(%d, %s), %s %s)", branch_nb++, $3, $5, $6);
+		 pop(branch_nb);
+		 attach_start(dot_file, ctx->funName);
+		 sprintf_safe($$, size, "\nif_stmt(branch(%d, %s), %s %s)", branch_nb++, $3, $6, $7);
 		 free($3);
-		 free($5);
 		 free($6);
-		} 
-	| SWITCH '(' expression ')' statement
-		{size_t const size = strlen("\nswitch_stmt(, )") + strlen($3) + strlen($5) + 1;
+		 free($7);
+		}  
+	| SWITCH '(' expression ')'{ctx->switchOn = true;} statement
+		{size_t const size = strlen("\nswitch_stmt(, )") + strlen($3) + strlen($6) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\nswitch_stmt(%s, %s)", $3, $5);
+		 sprintf_safe($$, size, "\nswitch_stmt(%s, %s)", $3, $6);
+		 ctx->isDefault = false;
+		 removeBreaks(ctx->loopNo);
 		 free($3);
-		 free($5);
+		 free($6);
 		} 
 	;
 
 else_opt
 	: /* empty */		%prec LOWER_THAN_ELSE 	{simple_str_lit_copy(&$$, "");}
-	| ELSE statement
-		{size_t const size = strlen(", ") + strlen($2) + 1;
+	| ELSE{
+			ctx->isFalse = true;
+			} 
+	statement
+		{
+		 size_t const size = strlen(", ") + strlen($3) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, ", %s", $2);
-		 free($2);
-		} 
-
-iteration_statement
-	: WHILE '(' expression ')' statement 
-		{size_t const size = strlen("\nwhile_stmt(branch(, ), )") + MAX_BRANCH_STR + strlen($3) + strlen($5) + 1;
-		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\nwhile_stmt(branch(%d, %s), %s)", branch_nb++, $3, $5);
+		 sprintf_safe($$, size, ", %s", $3);
+		 ctx->isFalse = false;
 		 free($3);
-		 free($5);
 		} 
-	| DO statement WHILE '(' expression ')' ';'
-		{size_t const size = strlen("\ndo_while_stmt(, branch(, ))") + strlen($2) + MAX_BRANCH_STR + strlen($5) + 1;
+iteration_statement
+	: WHILE '(' expression ')'{ 
+		push(ctx->isFalse, ctx->loopNo);
+		connectNodes(ctx);
+		ctx->loopNo++;
+		}statement 
+		{size_t const size = strlen("\nwhile_stmt(branch(, ), )") + MAX_BRANCH_STR + strlen($3) + strlen($6) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\ndo_while_stmt(%s, branch(%d, %s))", $2, branch_nb++, $5);
-		 free($2);
-		 free($5);
+		 loopAround();
+		 pop(branch_nb);
+		 attach_start(dot_file, ctx->funName);
+		 removeBreaks(ctx->loopNo);
+		 ctx->loopNo--;
+		 sprintf_safe($$, size, "\ndo_while_stmt(%s, branch(%d, %s))", $3, branch_nb++, $6);
+		 free($3);
+		 free($6);
 		} 
-	| FOR '(' for_stmt_type ')' statement	//replaced by an equivalent, a little ugly, while statement
-		{size_t const size = strlen("\ncmp_stmts([, \nwhile_stmt(branch(, ), \ncmp_stmts([, ]))])") + strlen($3.init) + MAX_BRANCH_STR + strlen($3.cond) + strlen($5) + strlen($3.update) + 1;
+	| DO {ctx->doWhile++; ctx->nestedDoWhile = true;}statement WHILE '(' expression ')' {
+		push(ctx->isFalse, ctx->loopNo);
+		connectNodes(ctx);
+		ctx->loopNo++;
+		} ';'
+		{ Node *temp = head;
+		 connectDoWhile(ctx->doWhile);
+		 pop(branch_nb);
+		 attach_start(dot_file, ctx->funName);
+		 removeBreaks(ctx->loopNo);
+		 ctx->doWhile--;
+		 ctx->nestedDoWhile = false;
+		 ctx->loopNo--;
+		 size_t const size = strlen("\ndo_while_stmt(, )") + strlen($3) + strlen($6) + 1;
 		 $$ = (char*)malloc(size);
-		 sprintf_safe($$, size, "\ncmp_stmts([%s, \nwhile_stmt(branch(%d, %s), \ncmp_stmts([%s, %s]))])", $3.init, branch_nb++, $3.cond, $5, $3.update);
+		 sprintf_safe($$, size, "\ndo_while_stmt(%s, branch(%d, %s))", $3, branch_nb++, $6);
+		 free($3);
+		 free($6);
+		} 
+	| FOR '(' for_stmt_type ')' {
+		push(ctx->isFalse, ctx->loopNo);
+		connectNodes(ctx);
+		ctx->loopNo++;
+		} statement	//replaced by an equivalent, a little ugly, while statement
+		{size_t const size = strlen("\ncmp_stmts([, \nwhile_stmt(branch(, ), \ncmp_stmts([, ]))])") + strlen($3.init) + MAX_BRANCH_STR + strlen($3.cond) + strlen($6) + strlen($3.update) + 1;
+		 $$ = (char*)malloc(size);
+		 loopAround();
+		 pop(branch_nb);
+		 attach_start(dot_file, ctx->funName); 
+		 removeBreaks(ctx->loopNo);
+		 ctx->loopNo--;
+		 sprintf_safe($$, size, "\ncmp_stmts([%s, \nwhile_stmt(branch(%d, %s), \ncmp_stmts([%s, %s]))])", $3.init, branch_nb++, $3.cond, $6, $3.update);
 		 free($3.init);
 		 free($3.cond);
 		 free($3.update);
-		 free($5);
+		 free($6);
 		} 
 	;
 //changed the original grammar by replacing the middle expression_statement (the condition) with expression_opt ';'
@@ -1398,16 +1495,52 @@ expression_opt
 jump_statement
 	: GOTO IDENTIFIER ';'	//in_label_namespace is already switched off within lexer after GOTO
 	  {in_label_namespace = 0;
+	   ctx->gotoParsed = true;
+	   if(top != NULL){
+			add_goto($2, top, ctx->isFalse);
+	   }else if(head != NULL){
+			if(head->true_path == NULL){
+				add_goto($2, head, 0);
+			}
+			if(head->false_path == NULL){
+				add_goto($2, head, 1);
+			}
+	    }
+	   ctx->isFalse = false;
 	   size_t const size = strlen("\ngoto_stmt(, )\n") + strlen($2) + strlen(current_function) + 1;
 	   $$ = (char*)malloc(size);
 	   sprintf_safe($$, size, "\ngoto_stmt(%s, %s)\n", $2, current_function);
 	   free($2);
 	  }
-	| CONTINUE ';'	{simple_str_lit_copy(&$$, "\ncontinue_stmt\n");}
-	| BREAK ';'		{simple_str_lit_copy(&$$, "\nbreak_stmt\n");}
-	| RETURN ';'  	{simple_str_lit_copy(&$$, "\nreturn_stmt\n");}
+	| CONTINUE ';'	{simple_str_lit_copy(&$$, "\ncontinue_stmt\n"); if(top->true_path == NULL){
+																		top->true_path = find_loop(ctx->loopNo);
+																	}else{
+																		join_nodes(find_loop(ctx->loopNo));
+																	}
+																	}
+	| BREAK ';'		{simple_str_lit_copy(&$$, "\nbreak_stmt\n");
+					 if(top != NULL && !ctx->switchOn){
+						if(ctx->isFalse){
+							top->false_path = getBreakPoint();
+						}
+						else if(top->true_path!=NULL){
+								join_nodes(getBreakPoint());
+						}else{
+							top->true_path = getBreakPoint();
+						}	
+						top->breakOn = ctx->loopNo;//if break is in loop than it will contain the loop no 1, 2, etc, otherwise 0.
+					 }else{
+						head->true_path = getBreakPoint();
+						head->breakOn = ctx->loopNo;
+					 }
+					
+												
+	}
+												
+	| RETURN ';'  	{simple_str_lit_copy(&$$, "\nreturn_stmt\n"); terminateNode(ctx->isFalse);}
 	| RETURN expression ';'
 	  {size_t const size = strlen("\nreturn_stmt()\n") + strlen($2) + 1;
+	   terminateNode(ctx->isFalse);
 	   $$ = (char*)malloc(size);
 	   sprintf_safe($$, size, "\nreturn_stmt(%s)\n", $2);
 	   free($2);
@@ -1425,6 +1558,7 @@ external_declaration		//printed out
 		{handled_function_paramaters = 0;
 		 pop_scope(&current_scope);
 		 fprintf(pl_file, "%s", $1); 
+		 
 		 free($1);
 		}
 	| declaration			
@@ -1439,11 +1573,19 @@ external_declaration		//printed out
 	;
 //always in_ordinary_id_declaration = 0; after
 function_definition
-	: declaration_specifiers declarator declaration_list_opt {in_ordinary_id_declaration = 0;} compound_statement
+	: declaration_specifiers declarator declaration_list_opt {in_ordinary_id_declaration = 0;   ctx->funName = NULL;
+																								ctx->funName = strdup($2.ptr_declarator);
+																								fprintf(dot_file, "subgraph %s{\n", $2.ptr_declarator);
+																								startNode = true;
+		} compound_statement
 		{in_ordinary_id_declaration = 0;
 		 size_t const size = strlen("function([], , [], )") + strlen($1) + strlen($2.full) + strlen($3) + strlen($5) + 1;
 	     $$ = (char*)malloc(size);
 	     sprintf_safe($$, size, "function([%s], %s, [%s], %s)", $1, $2.full, $3, $5);
+		 removeBreaks(ctx->loopNo);
+		 resolve_gotos();
+		 populate_dot_file(dot_file,ctx->funName);
+		 fprintf(dot_file, "}\n");
 		 if (debugMode) printf("function parser\n");
 		 ctx->isInt = false;
 	     free($1);
@@ -1526,6 +1668,25 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, ".pl file could not be created for writing at: %s\n", pl_file_uri);
 		my_exit(EXIT_FAILURE);
 	}
+	// Open the .dot file for writing
+    sprintf_safe(dot_file_uri, 3 * MAX_PATH, "%s/%s.dot", C_file_path, filename_no_ext);
+    dot_file = fopen(dot_file_uri, "w");
+    if (!dot_file) {
+        fprintf(stderr, ".dot file could not be created for writing at: %s\n", dot_file_uri);
+        my_exit(EXIT_FAILURE);
+    }
+
+	sprintf_safe(call_graph_uri, 3 * MAX_PATH, "%s/%s_call_graph.dot", C_file_path, filename_no_ext);
+	call_graph = fopen(call_graph_uri, "w");
+	if(!call_graph){
+		fprintf(stderr, "call_graph.dot file could not be created for writing at: %s\n", call_graph_uri);
+        my_exit(EXIT_FAILURE);
+	}
+
+
+    // Write initial content to the .dot file
+    fprintf(dot_file, "digraph CFG {\n");
+	fprintf(call_graph, "digraph call_graph {\n");
 	fprintf(pl_file, "prolog_c([");			//opening predicate
 	if (yyparse(&ctx) != 0) {					//the parser is called
 		fprintf(stderr, "Parsing failed.\n");
@@ -1533,7 +1694,16 @@ int main(int argc, char *argv[]) {
 	}	
 	fprintf(pl_file, "\n]).");
 	fclose(pl_file);
+	free_storage();
 	pl_file = NULL;
+	fprintf(dot_file, "}\n");
+    fclose(dot_file);
+    dot_file = NULL;
+
+	fprintf(call_graph, "}\n");
+    fclose(call_graph);
+    call_graph = NULL;
+
 	fclose(i_file);
 	i_file = NULL;
 	my_exit(EXIT_SUCCESS);
@@ -1589,6 +1759,20 @@ void process_declaration_specifiers(char a[]) {
     free(temp);
 }
 
+//method for some validations while parsing each node.
+void connectNodes(ParserContext *ctx){	
+		join_nodes(top);
+		if(ctx->nestedDoWhile){
+			top->inDoWhile = ctx->doWhile;
+			ctx->nestedDoWhile = false;
+		}
+		if(ctx->labelParsed){
+			add_label(ctx->label_name, top);
+			ctx->labelParsed = false;
+			strcpy(ctx->label_name, "");
+		}
+		ctx->isFalse = false;
+}
 
 //handles parsing errors: since the C input file is the output of a C pre-processor it will only be called if
 //  the syntax rules are wrong due to GCC extensions 

@@ -1,0 +1,14 @@
+digraph CFG {
+subgraph Main{
+"Start Main" -> "End Main";
+}
+subgraph Greet{
+"Start Greet" -> "End Greet";
+}
+subgraph Add{
+"Start Add" -> "End Add";
+}
+subgraph Print_message{
+"Start Print_message" -> "End Print_message";
+}
+}
