@@ -31,6 +31,7 @@
 #include "parser.h"
 #include "utils.c"
 #include "handle_typedefs.c"
+#include "Symbol_table.c"
 
 typedef struct {
     bool isTypeDef;
@@ -56,6 +57,8 @@ extern int yylineno;
 
 extern FILE *yyin;
 extern char *yytext;
+extern void set_to_user_define(char *function);
+extern void add_branch_number(char* function_name, int branch_num);
 
 #define MAX_PATH 256
 #define MAX_BRANCH_STR 9		//maximum length of the string encoding the number of branches (max is "999999999" i.e. 1 billion - 1)
@@ -1005,6 +1008,8 @@ direct_declarator
 		 size_t const size = strlen("function(, )") + strlen($1.full) + strlen($4) + 1;
 	     $$.full = (char*)malloc(size);
 	     sprintf_safe($$.full, size, "function(%s, %s)", $1.full, $4);
+		 add_branch_number($1.full, branch_nb);
+		 set_to_user_define($1.full);
 		 current_function = strdup($1.full);
 	     free($1.full);
 		 $$.ptr_declarator = $1.ptr_declarator;
